@@ -180,3 +180,109 @@
 
         (var-set total-staked (- (var-get total-staked) amount))
         (ok true)))
+
+
+;; Claim Management Functions
+(define-public (submit-claim 
+    (pool-id uint) 
+    (amount uint)
+    (evidence (string-ascii 256)))
+    (let
+        ((claim-id (+ (var-get next-claim-id) u1))
+         (pool (unwrap! (map-get? InsurancePools { pool-id: pool-id }) ERR-POOL-NOT-FOUND)))
+
+        (asserts! (is-eq (get status pool) POOL-ACTIVE) ERR-INVALID-POOL-STATE)
+        (asserts! (<= amount (get coverage-limit pool)) ERR-INVALID-AMOUNT)
+
+        ;; Create claim
+        (map-set InsuranceClaims
+            { claim-id: claim-id }
+            {
+                pool-id: pool-id,
+                claimer: tx-sender,
+                amount: amount,
+                evidence: evidence,
+                status: CLAIM-PENDING,
+                yes-votes: u0,
+                no-votes: u0,
+                voters: (list ),
+                claim-height: stacks-block-height,
+                voting-end-height: (+ stacks-block-height VOTING-PERIOD)
+            })
+
+        ;; Update counters
+        (var-set next-claim-id claim-id)
+        (map-set InsurancePools
+            { pool-id: pool-id }
+            (merge pool {
+                claim-count: (+ (get claim-count pool) u1)
+            }))
+
+        (ok claim-id)))
+
+(define-public (vote-on-claim (claim-id uint) (approve bool))
+    (let
+        ((claim (unwrap! (map-get? InsuranceClaims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+         (stake (unwrap! (map-get? PoolStakes 
+            { pool-id: (get pool-id claim), staker: tx-sender }) ERR-UNAUTHORIZED)))
+
+        (asserts! (< stacks-block-height (get voting-end-height claim)) ERR-VOTING-CLOSED)
+        (asserts! (is-eq (get status claim) CLAIM-PENDING) ERR-INVALID-POOL-STATE)
+        (asserts! (not (is-some (index-of (get voters claim) tx-sender))) ERR-ALREADY-VOTED)
+
+        ;; Update votes
+        (map-set InsuranceClaims
+            { claim-id: claim-id }
+            (merge claim {
+                yes-votes: (if approve
+                            (+ (get yes-votes claim) (get amount stake))
+                            (get yes-votes claim)),
+                no-votes: (if approve
+                            (get no-votes claim)
+                            (+ (get no-votes claim) (get amount stake))),
+                voters: (unwrap! (as-max-len? 
+                    (append (get voters claim) tx-sender) u100)
+                    ERR-UNAUTHORIZED)
+            }))
+        (ok true)))
+
+(define-public (process-claim (claim-id uint))
+    (let
+        ((claim (unwrap! (map-get? InsuranceClaims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+         (pool (unwrap! (map-get? InsurancePools { pool-id: (get pool-id claim) }) ERR-POOL-NOT-FOUND))
+         (total-votes (+ (get yes-votes claim) (get no-votes claim))))
+
+        (asserts! (>= stacks-block-height (get voting-end-height claim)) ERR-VOTING-CLOSED)
+        (asserts! (is-eq (get status claim) CLAIM-PENDING) ERR-INVALID-POOL-STATE)
+        (asserts! (>= total-votes MIN-VOTES-REQUIRED) ERR-INSUFFICIENT-VOTES)
+
+        (if (>= (* (get yes-votes claim) u10) (* total-votes APPROVAL-THRESHOLD))
+            (begin
+                ;; Pay out claim
+                (as-contract (try! (stx-transfer? 
+                    (get amount claim) 
+                    tx-sender 
+                    (get claimer claim))))
+
+                ;; Update claim status
+                (map-set InsuranceClaims
+                    { claim-id: claim-id }
+                    (merge claim { status: CLAIM-PAID })))
+            ;; Reject claim
+            (map-set InsuranceClaims
+                { claim-id: claim-id }
+                (merge claim { status: CLAIM-REJECTED })))
+        (ok true)))
+
+;; Read-only functions
+(define-read-only (get-pool-info (pool-id uint))
+    (map-get? InsurancePools { pool-id: pool-id }))
+
+(define-read-only (get-stake-info (pool-id uint) (staker principal))
+    (map-get? PoolStakes { pool-id: pool-id, staker: staker }))
+
+(define-read-only (get-claim-info (claim-id uint))
+    (map-get? InsuranceClaims { claim-id: claim-id }))
+
+(define-read-only (get-staker-total (staker principal))
+    (map-get? StakerTotalStake { staker: staker }))
